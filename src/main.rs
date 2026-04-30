@@ -1,0 +1,451 @@
+use std::fs::{self, File};
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+
+const HWRNG_DIR: &str = "/sys/class/misc/hw_random";
+const HWRNG_DEV: &str = "/dev/hwrng";
+
+#[derive(Parser)]
+#[command(name = "hwrng", about = "Manage the Linux hwrng subsystem", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Switch the currently active hwrng to one matching NAME.
+    ///
+    /// NAME is matched against /sys/class/misc/hw_random/rng_available:
+    /// first an exact match, then a unique prefix match (so `infnoise`
+    /// resolves to `infnoise-1-1:1.0`).
+    Switch {
+        /// Name or unique prefix of the rng to activate.
+        name: String,
+    },
+
+    /// List available rngs, marking the active one with `*`.
+    List,
+
+    /// Print detailed metadata for every registered rng.
+    Info,
+
+    /// Read BYTES of randomness from /dev/hwrng to stdout.
+    ///
+    /// Raw bytes are written to stdout; pipe to xxd, hexdump, or a file.
+    /// Pass --hex to print a hex string instead. Reading /dev/hwrng
+    /// requires root on most systems.
+    Read {
+        /// Number of bytes to read.
+        bytes: u64,
+        /// Print as a hex string followed by a newline instead of raw bytes.
+        #[arg(long)]
+        hex: bool,
+    },
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Command::Switch { name } => switch(&name),
+        Command::List => list(),
+        Command::Info => info(),
+        Command::Read { bytes, hex } => read_random(bytes, hex),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("hwrng: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn switch(query: &str) -> Result<(), String> {
+    let dir = Path::new(HWRNG_DIR);
+    let available = read_trimmed(&dir.join("rng_available"))?;
+    let names: Vec<&str> = available.split_whitespace().collect();
+
+    let target = resolve(&names, query)?;
+
+    let current = read_trimmed(&dir.join("rng_current")).unwrap_or_default();
+    if current == target {
+        println!("hwrng already set to {target}");
+        return Ok(());
+    }
+
+    fs::write(dir.join("rng_current"), target.as_bytes()).map_err(|e| {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            format!("writing rng_current requires root (try sudo): {e}")
+        } else {
+            format!("failed to write rng_current: {e}")
+        }
+    })?;
+
+    println!("switched hwrng: {current} -> {target}");
+    Ok(())
+}
+
+fn list() -> Result<(), String> {
+    let dir = Path::new(HWRNG_DIR);
+    let available = read_trimmed(&dir.join("rng_available"))?;
+    let current = read_trimmed(&dir.join("rng_current")).unwrap_or_default();
+
+    for name in available.split_whitespace() {
+        let marker = if name == current { "*" } else { " " };
+        println!("{marker} {name}");
+    }
+    Ok(())
+}
+
+fn info() -> Result<(), String> {
+    let dir = Path::new(HWRNG_DIR);
+    let available = read_trimmed(&dir.join("rng_available"))?;
+    let current = read_trimmed(&dir.join("rng_current")).unwrap_or_default();
+    let quality = read_trimmed(&dir.join("rng_quality")).ok();
+    let selected = read_trimmed(&dir.join("rng_selected")).ok();
+
+    let names: Vec<&str> = available.split_whitespace().collect();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        if *name == current {
+            println!("{name} [active]");
+            if let Some(q) = &quality {
+                println!("  quality:     {q}/1024 bits");
+            }
+            if let Some(s) = &selected {
+                let label = match s.as_str() {
+                    "1" => "user",
+                    "0" => "kernel default",
+                    other => other,
+                };
+                println!("  selected:    {label}");
+            }
+        } else {
+            println!("{name}");
+        }
+        describe_device(name);
+    }
+    Ok(())
+}
+
+fn describe_device(name: &str) {
+    if name == "none" {
+        println!("  (kernel no-op rng)");
+        return;
+    }
+    if let Some(idx) = name.strip_prefix("tpm-rng-") {
+        let path = PathBuf::from(format!("/sys/class/tpm/tpm{idx}"));
+        if path.exists() {
+            describe_tpm(&path);
+            return;
+        }
+    }
+    if let Some((_, suffix)) = name.split_once('-') {
+        let usb_intf = PathBuf::from("/sys/bus/usb/devices").join(suffix);
+        if usb_intf.exists() {
+            describe_usb(&usb_intf, suffix);
+            return;
+        }
+    }
+    for bus in ["virtio", "pci", "platform"] {
+        if let Some(dev) = find_bus_device(name, bus) {
+            describe_bus_device(&dev, bus);
+            return;
+        }
+    }
+    println!("  (no device mapping known)");
+}
+
+fn find_bus_device(rng_name: &str, bus: &str) -> Option<PathBuf> {
+    let drivers_dir = PathBuf::from(format!("/sys/bus/{bus}/drivers"));
+    let target = normalize_root(rng_name);
+    let target_idx = parse_trailing_index(rng_name);
+    for entry in fs::read_dir(&drivers_dir).ok()?.flatten() {
+        let drv_name = entry.file_name().to_string_lossy().into_owned();
+        if normalize_root(&drv_name) != target {
+            continue;
+        }
+        let mut devs: Vec<PathBuf> = fs::read_dir(entry.path())
+            .ok()?
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_symlink()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect();
+        devs.sort();
+        let pick = match target_idx {
+            Some(i) => devs.into_iter().nth(i),
+            None => devs.into_iter().next(),
+        };
+        return pick.and_then(|p| fs::canonicalize(&p).ok());
+    }
+    None
+}
+
+fn describe_bus_device(path: &Path, bus: &str) {
+    println!("  device:      {}", path.display());
+    if let Some(d) = readlink_basename(&path.join("driver")) {
+        println!("  driver:      {d}");
+    }
+    if let Some(m) = read_opt(&path.join("modalias")) {
+        println!("  modalias:    {m}");
+    }
+    match bus {
+        "pci" => {
+            if let Some(bdf) = path.file_name() {
+                println!("  pci-bdf:     {}", bdf.to_string_lossy());
+            }
+            if let Some(v) = read_opt(&path.join("vendor")) {
+                println!("  pci-vendor:  {v}");
+            }
+            if let Some(d) = read_opt(&path.join("device")) {
+                println!("  pci-device:  {d}");
+            }
+            if let Some(c) = read_opt(&path.join("class")) {
+                println!("  pci-class:   {c}");
+            }
+        }
+        "virtio" => {
+            if let Some(v) = read_opt(&path.join("vendor")) {
+                println!("  virtio-vendor: {v}");
+            }
+            if let Some(d) = read_opt(&path.join("device")) {
+                println!("  virtio-device: {d}");
+            }
+        }
+        "platform" => {
+            if let Some(of) = read_opt(&path.join("of_node/compatible")) {
+                println!("  of-compatible: {of}");
+            }
+            if let Some(fw) = readlink_basename(&path.join("firmware_node")) {
+                println!("  firmware:    {fw}");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_root(s: &str) -> String {
+    let mut out = s.to_ascii_lowercase().replace(['_', '.'], "-");
+    if let Some(idx) = out.rfind('-') {
+        if idx > 0 && out[idx + 1..].chars().all(|c| c.is_ascii_digit()) {
+            out.truncate(idx);
+        }
+    }
+    loop {
+        let trimmed = out
+            .strip_suffix("-trng")
+            .or_else(|| out.strip_suffix("-hwrng"))
+            .or_else(|| out.strip_suffix("-rng"))
+            .map(str::to_string);
+        match trimmed {
+            Some(t) => out = t,
+            None => break,
+        }
+    }
+    out
+}
+
+fn parse_trailing_index(s: &str) -> Option<usize> {
+    let last = s.rsplit(|c: char| c == '.' || c == '-').next()?;
+    if !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()) {
+        last.parse().ok()
+    } else {
+        None
+    }
+}
+
+fn describe_tpm(path: &Path) {
+    println!("  device:      {}", path.display());
+    if let Some(v) = read_opt(&path.join("tpm_version_major")) {
+        println!("  tpm-version: {v}");
+    }
+    if let Some(d) = readlink_basename(&path.join("device/driver")) {
+        println!("  driver:      {d}");
+    }
+    if let Some(m) = read_opt(&path.join("device/modalias")) {
+        println!("  modalias:    {m}");
+    }
+}
+
+fn describe_usb(intf_path: &Path, suffix: &str) {
+    println!("  device:      {}", intf_path.display());
+    if let Some(d) = readlink_basename(&intf_path.join("driver")) {
+        println!("  driver:      {d}");
+    }
+    if let Some(m) = read_opt(&intf_path.join("modalias")) {
+        println!("  modalias:    {m}");
+    }
+    let Some(parent_id) = suffix.split(':').next() else {
+        return;
+    };
+    let parent = PathBuf::from("/sys/bus/usb/devices").join(parent_id);
+    if !parent.exists() {
+        return;
+    }
+    let vendor = read_opt(&parent.join("idVendor"));
+    let manufacturer = read_opt(&parent.join("manufacturer"));
+    let product = read_opt(&parent.join("idProduct"));
+    let product_name = read_opt(&parent.join("product"));
+    match (&vendor, &manufacturer) {
+        (Some(v), Some(m)) => println!("  usb-vendor:  {v} ({m})"),
+        (Some(v), None) => println!("  usb-vendor:  {v}"),
+        _ => {}
+    }
+    match (&product, &product_name) {
+        (Some(p), Some(n)) => println!("  usb-product: {p} ({n})"),
+        (Some(p), None) => println!("  usb-product: {p}"),
+        _ => {}
+    }
+    if let Some(s) = read_opt(&parent.join("serial")) {
+        println!("  serial:      {s}");
+    }
+    if let Some(b) = read_opt(&parent.join("bcdDevice")) {
+        println!("  bcd-device:  {b}");
+    }
+}
+
+fn read_opt(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn readlink_basename(link: &Path) -> Option<String> {
+    fs::read_link(link)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+}
+
+fn read_random(bytes: u64, hex: bool) -> Result<(), String> {
+    let mut stdout = io::stdout().lock();
+    if !hex && stdout.is_terminal() {
+        return Err(
+            "refusing to write binary to a terminal; pass --hex or redirect stdout".into(),
+        );
+    }
+
+    let mut dev = File::open(HWRNG_DEV).map_err(|e| {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            format!("opening {HWRNG_DEV} requires root (try sudo): {e}")
+        } else {
+            format!("failed to open {HWRNG_DEV}: {e}")
+        }
+    })?;
+
+    let mut remaining = bytes;
+    let mut buf = [0u8; 4096];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        dev.read_exact(&mut buf[..want])
+            .map_err(|e| format!("read from {HWRNG_DEV} failed: {e}"))?;
+        if hex {
+            let mut hex_buf = String::with_capacity(want * 2);
+            for b in &buf[..want] {
+                use std::fmt::Write as _;
+                let _ = write!(hex_buf, "{b:02x}");
+            }
+            stdout
+                .write_all(hex_buf.as_bytes())
+                .map_err(|e| format!("write to stdout failed: {e}"))?;
+        } else {
+            stdout
+                .write_all(&buf[..want])
+                .map_err(|e| format!("write to stdout failed: {e}"))?;
+        }
+        remaining -= want as u64;
+    }
+    if hex {
+        stdout
+            .write_all(b"\n")
+            .map_err(|e| format!("write to stdout failed: {e}"))?;
+    }
+    Ok(())
+}
+
+fn resolve(names: &[&str], query: &str) -> Result<String, String> {
+    if let Some(exact) = names.iter().find(|n| **n == query) {
+        return Ok((*exact).to_string());
+    }
+    let prefix_matches: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| n.starts_with(query))
+        .collect();
+    match prefix_matches.as_slice() {
+        [] => Err(format!(
+            "no rng matches '{query}'. available: {}",
+            names.join(", ")
+        )),
+        [only] => Ok((*only).to_string()),
+        [first, rest @ ..] => {
+            eprintln!(
+                "hwrng: '{query}' matches {}, picking {first}",
+                std::iter::once(*first)
+                    .chain(rest.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            Ok((*first).to_string())
+        }
+    }
+}
+
+fn read_trimmed(path: &Path) -> Result<String, String> {
+    fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_root, parse_trailing_index, resolve};
+
+    #[test]
+    fn normalize_aligns_rng_and_driver_names() {
+        // virtio: rng is "virtio_rng.N", driver is "virtio_rng".
+        assert_eq!(normalize_root("virtio_rng.0"), "virtio");
+        assert_eq!(normalize_root("virtio_rng"), "virtio");
+        // platform: rng is "bcm2835", driver is "bcm2835-rng".
+        assert_eq!(normalize_root("bcm2835"), "bcm2835");
+        assert_eq!(normalize_root("bcm2835-rng"), "bcm2835");
+        // pci: rng "intel-rng" / driver "intel-rng".
+        assert_eq!(normalize_root("intel-rng"), "intel");
+        // omap uses underscore in driver name.
+        assert_eq!(normalize_root("omap_rng"), "omap");
+        // -trng / -hwrng variants.
+        assert_eq!(normalize_root("ingenic-trng"), "ingenic");
+        assert_eq!(normalize_root("foo-hwrng"), "foo");
+        // tpm path is short-circuited elsewhere; just make sure it normalizes sanely.
+        assert_eq!(normalize_root("tpm-rng-0"), "tpm");
+    }
+
+    #[test]
+    fn trailing_index_is_extracted_from_dot_or_dash() {
+        assert_eq!(parse_trailing_index("virtio_rng.0"), Some(0));
+        assert_eq!(parse_trailing_index("virtio_rng.3"), Some(3));
+        assert_eq!(parse_trailing_index("tpm-rng-2"), Some(2));
+        assert_eq!(parse_trailing_index("bcm2835"), None);
+        assert_eq!(parse_trailing_index("intel-rng"), None);
+    }
+
+    #[test]
+    fn resolve_picks_first_on_ambiguous_prefix() {
+        let names = vec!["infnoise-1-1:1.0", "infnoise-2-1:1.0", "tpm-rng-0"];
+        // single-match prefix.
+        assert_eq!(resolve(&names, "tpm").unwrap(), "tpm-rng-0");
+        // ambiguous prefix → first match.
+        assert_eq!(resolve(&names, "infnoise").unwrap(), "infnoise-1-1:1.0");
+        // exact match wins even when it'd also be a prefix.
+        let names2 = vec!["foo", "foobar"];
+        assert_eq!(resolve(&names2, "foo").unwrap(), "foo");
+        // no match → error.
+        assert!(resolve(&names, "nope").is_err());
+    }
+}
