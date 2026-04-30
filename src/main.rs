@@ -2,6 +2,8 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -45,6 +47,20 @@ enum Command {
         #[arg(long)]
         hex: bool,
     },
+
+    /// Keep an rng of NAME active, switching to it whenever it appears.
+    ///
+    /// Polls rng_available/rng_current and switches whenever a matching rng
+    /// is present but not the active one — useful for hot-plugged devices
+    /// (unplug + replug) or when multiple instances may come and go.
+    /// NAME uses the same exact/first-prefix match as `switch`.
+    Watch {
+        /// Name or unique prefix of the rng to keep active.
+        name: String,
+        /// Poll interval in seconds.
+        #[arg(long, default_value_t = 2.0)]
+        interval: f64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -54,6 +70,7 @@ fn main() -> ExitCode {
         Command::List => list(),
         Command::Info => info(),
         Command::Read { bytes, hex } => read_random(bytes, hex),
+        Command::Watch { name, interval } => watch(&name, interval),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -87,6 +104,67 @@ fn switch(query: &str) -> Result<(), String> {
 
     println!("switched hwrng: {current} -> {target}");
     Ok(())
+}
+
+fn watch(query: &str, interval_secs: f64) -> Result<(), String> {
+    if !(interval_secs.is_finite() && interval_secs > 0.0) {
+        return Err(format!("invalid --interval {interval_secs}: must be > 0"));
+    }
+    let interval = Duration::from_secs_f64(interval_secs);
+    let dir = Path::new(HWRNG_DIR);
+
+    eprintln!("hwrng: watching for '{query}', polling every {interval_secs}s (Ctrl-C to stop)");
+
+    let mut last_state: Option<String> = None;
+    loop {
+        let available = read_trimmed(&dir.join("rng_available"))?;
+        let current = read_trimmed(&dir.join("rng_current")).unwrap_or_default();
+        let names: Vec<&str> = available.split_whitespace().collect();
+        let target = first_match(&names, query);
+
+        let state = match &target {
+            Some(t) if **t == current => format!("ok:{t}"),
+            Some(t) => format!("switch:{current}->{t}"),
+            None => format!("missing:current={current}"),
+        };
+        let log_now = last_state.as_deref() != Some(&state);
+
+        match target {
+            Some(t) if t != current => {
+                if log_now {
+                    eprintln!("hwrng: switching {current} -> {t}");
+                }
+                if let Err(e) = fs::write(dir.join("rng_current"), t.as_bytes()) {
+                    if e.kind() == io::ErrorKind::PermissionDenied {
+                        return Err(format!("writing rng_current requires root: {e}"));
+                    }
+                    if log_now {
+                        eprintln!("hwrng: switch to {t} failed: {e}");
+                    }
+                }
+            }
+            Some(t) => {
+                if log_now {
+                    eprintln!("hwrng: '{query}' active as {t}");
+                }
+            }
+            None => {
+                if log_now {
+                    eprintln!("hwrng: no rng matches '{query}' (current: {current})");
+                }
+            }
+        }
+
+        last_state = Some(state);
+        thread::sleep(interval);
+    }
+}
+
+fn first_match<'a>(names: &[&'a str], query: &str) -> Option<&'a str> {
+    if let Some(exact) = names.iter().find(|n| **n == query) {
+        return Some(*exact);
+    }
+    names.iter().copied().find(|n| n.starts_with(query))
 }
 
 fn list() -> Result<(), String> {
@@ -405,7 +483,7 @@ fn read_trimmed(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_root, parse_trailing_index, resolve};
+    use super::{first_match, normalize_root, parse_trailing_index, resolve};
 
     #[test]
     fn normalize_aligns_rng_and_driver_names() {
@@ -433,6 +511,14 @@ mod tests {
         assert_eq!(parse_trailing_index("tpm-rng-2"), Some(2));
         assert_eq!(parse_trailing_index("bcm2835"), None);
         assert_eq!(parse_trailing_index("intel-rng"), None);
+    }
+
+    #[test]
+    fn first_match_prefers_exact_then_first_prefix() {
+        let names = vec!["infnoise-1-1:1.0", "infnoise-2-1:1.0", "tpm-rng-0"];
+        assert_eq!(first_match(&names, "infnoise"), Some("infnoise-1-1:1.0"));
+        assert_eq!(first_match(&names, "tpm-rng-0"), Some("tpm-rng-0"));
+        assert_eq!(first_match(&names, "nope"), None);
     }
 
     #[test]
