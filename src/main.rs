@@ -19,14 +19,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Switch the currently active hwrng to one matching NAME.
+    /// Switch the currently active hwrng to the first available NAME.
     ///
-    /// NAME is matched against /sys/class/misc/hw_random/rng_available:
+    /// Each NAME is matched against /sys/class/misc/hw_random/rng_available:
     /// first an exact match, then a unique prefix match (so `infnoise`
-    /// resolves to `infnoise-1-1:1.0`).
+    /// resolves to `infnoise-1-1:1.0`). Multiple NAMEs may be passed as a
+    /// preference list in CLI order; the first one that resolves wins.
     Switch {
-        /// Name or unique prefix of the rng to activate.
-        name: String,
+        /// Names (or unique prefixes) in preference order; the first available is activated.
+        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        names: Vec<String>,
     },
 
     /// List available rngs, marking the active one with `*`.
@@ -48,15 +50,17 @@ enum Command {
         hex: bool,
     },
 
-    /// Keep an rng of NAME active, switching to it whenever it appears.
+    /// Keep the highest-priority NAME active, switching whenever it appears.
     ///
-    /// Polls rng_available/rng_current and switches whenever a matching rng
-    /// is present but not the active one — useful for hot-plugged devices
-    /// (unplug + replug) or when multiple instances may come and go.
-    /// NAME uses the same exact/first-prefix match as `switch`.
+    /// Polls rng_available/rng_current and switches whenever a higher-ranked
+    /// match is present but not the active one — useful for hot-plugged
+    /// devices (unplug + replug) or when multiple instances may come and go.
+    /// Each NAME uses the same exact/first-prefix match as `switch`; pass
+    /// multiple NAMEs as a preference list in CLI order.
     Watch {
-        /// Name or unique prefix of the rng to keep active.
-        name: String,
+        /// Names (or unique prefixes) in preference order; the highest-ranked available match is kept active.
+        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        names: Vec<String>,
         /// Poll interval in seconds.
         #[arg(long, default_value_t = 2.0)]
         interval: f64,
@@ -66,11 +70,11 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Switch { name } => switch(&name),
+        Command::Switch { names } => switch(&names),
         Command::List => list(),
         Command::Info => info(),
         Command::Read { bytes, hex } => read_random(bytes, hex),
-        Command::Watch { name, interval } => watch(&name, interval),
+        Command::Watch { names, interval } => watch(&names, interval),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -81,12 +85,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn switch(query: &str) -> Result<(), String> {
+fn switch(queries: &[String]) -> Result<(), String> {
     let dir = Path::new(HWRNG_DIR);
     let available = read_trimmed(&dir.join("rng_available"))?;
     let names: Vec<&str> = available.split_whitespace().collect();
 
-    let target = resolve(&names, query)?;
+    let target = resolve_preferred(&names, queries)?;
 
     let current = read_trimmed(&dir.join("rng_current")).unwrap_or_default();
     if current == target {
@@ -106,21 +110,22 @@ fn switch(query: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn watch(query: &str, interval_secs: f64) -> Result<(), String> {
+fn watch(queries: &[String], interval_secs: f64) -> Result<(), String> {
     if !(interval_secs.is_finite() && interval_secs > 0.0) {
         return Err(format!("invalid --interval {interval_secs}: must be > 0"));
     }
     let interval = Duration::from_secs_f64(interval_secs);
     let dir = Path::new(HWRNG_DIR);
 
-    eprintln!("hwrng: watching for '{query}', polling every {interval_secs}s (Ctrl-C to stop)");
+    let pretty = format_query_list(queries);
+    eprintln!("hwrng: watching for {pretty}, polling every {interval_secs}s (Ctrl-C to stop)");
 
     let mut last_state: Option<String> = None;
     loop {
         let available = read_trimmed(&dir.join("rng_available"))?;
         let current = read_trimmed(&dir.join("rng_current")).unwrap_or_default();
         let names: Vec<&str> = available.split_whitespace().collect();
-        let target = first_match(&names, query);
+        let target = first_preferred_match(&names, queries);
 
         let state = match &target {
             Some(t) if **t == current => format!("ok:{t}"),
@@ -145,12 +150,12 @@ fn watch(query: &str, interval_secs: f64) -> Result<(), String> {
             }
             Some(t) => {
                 if log_now {
-                    eprintln!("hwrng: '{query}' active as {t}");
+                    eprintln!("hwrng: {pretty} active as {t}");
                 }
             }
             None => {
                 if log_now {
-                    eprintln!("hwrng: no rng matches '{query}' (current: {current})");
+                    eprintln!("hwrng: no rng matches {pretty} (current: {current})");
                 }
             }
         }
@@ -165,6 +170,18 @@ fn first_match<'a>(names: &[&'a str], query: &str) -> Option<&'a str> {
         return Some(*exact);
     }
     names.iter().copied().find(|n| n.starts_with(query))
+}
+
+fn first_preferred_match<'a>(names: &[&'a str], queries: &[String]) -> Option<&'a str> {
+    queries.iter().find_map(|q| first_match(names, q))
+}
+
+fn format_query_list(queries: &[String]) -> String {
+    if queries.len() == 1 {
+        format!("'{}'", queries[0])
+    } else {
+        format!("[{}]", queries.join(", "))
+    }
 }
 
 fn list() -> Result<(), String> {
@@ -447,9 +464,9 @@ fn read_random(bytes: u64, hex: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve(names: &[&str], query: &str) -> Result<String, String> {
+fn try_resolve(names: &[&str], query: &str) -> Option<String> {
     if let Some(exact) = names.iter().find(|n| **n == query) {
-        return Ok((*exact).to_string());
+        return Some((*exact).to_string());
     }
     let prefix_matches: Vec<&str> = names
         .iter()
@@ -457,11 +474,8 @@ fn resolve(names: &[&str], query: &str) -> Result<String, String> {
         .filter(|n| n.starts_with(query))
         .collect();
     match prefix_matches.as_slice() {
-        [] => Err(format!(
-            "no rng matches '{query}'. available: {}",
-            names.join(", ")
-        )),
-        [only] => Ok((*only).to_string()),
+        [] => None,
+        [only] => Some((*only).to_string()),
         [first, rest @ ..] => {
             eprintln!(
                 "hwrng: '{query}' matches {}, picking {first}",
@@ -470,9 +484,22 @@ fn resolve(names: &[&str], query: &str) -> Result<String, String> {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            Ok((*first).to_string())
+            Some((*first).to_string())
         }
     }
+}
+
+fn resolve_preferred(names: &[&str], queries: &[String]) -> Result<String, String> {
+    for q in queries {
+        if let Some(r) = try_resolve(names, q) {
+            return Ok(r);
+        }
+    }
+    Err(format!(
+        "no rng matches {}. available: {}",
+        format_query_list(queries),
+        names.join(", ")
+    ))
 }
 
 fn read_trimmed(path: &Path) -> Result<String, String> {
@@ -483,7 +510,9 @@ fn read_trimmed(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_match, normalize_root, parse_trailing_index, resolve};
+    use super::{
+        first_match, first_preferred_match, normalize_root, parse_trailing_index, resolve_preferred,
+    };
 
     #[test]
     fn normalize_aligns_rng_and_driver_names() {
@@ -522,16 +551,56 @@ mod tests {
     }
 
     #[test]
-    fn resolve_picks_first_on_ambiguous_prefix() {
+    fn resolve_preferred_picks_first_on_ambiguous_prefix() {
         let names = vec!["infnoise-1-1:1.0", "infnoise-2-1:1.0", "tpm-rng-0"];
+        let q = |s: &str| vec![s.to_string()];
         // single-match prefix.
-        assert_eq!(resolve(&names, "tpm").unwrap(), "tpm-rng-0");
+        assert_eq!(resolve_preferred(&names, &q("tpm")).unwrap(), "tpm-rng-0");
         // ambiguous prefix → first match.
-        assert_eq!(resolve(&names, "infnoise").unwrap(), "infnoise-1-1:1.0");
+        assert_eq!(
+            resolve_preferred(&names, &q("infnoise")).unwrap(),
+            "infnoise-1-1:1.0"
+        );
         // exact match wins even when it'd also be a prefix.
         let names2 = vec!["foo", "foobar"];
-        assert_eq!(resolve(&names2, "foo").unwrap(), "foo");
+        assert_eq!(resolve_preferred(&names2, &q("foo")).unwrap(), "foo");
         // no match → error.
-        assert!(resolve(&names, "nope").is_err());
+        assert!(resolve_preferred(&names, &q("nope")).is_err());
+    }
+
+    #[test]
+    fn resolve_preferred_falls_back_in_cli_order() {
+        let names = vec!["infnoise-1-1:1.0", "tpm-rng-0"];
+        let queries = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // first preference unavailable → fall back to second.
+        assert_eq!(
+            resolve_preferred(&names, &queries(&["nonsense", "tpm"])).unwrap(),
+            "tpm-rng-0"
+        );
+        // first preference available → wins even if later ones also match.
+        assert_eq!(
+            resolve_preferred(&names, &queries(&["infnoise", "tpm"])).unwrap(),
+            "infnoise-1-1:1.0"
+        );
+        // none match → error.
+        assert!(resolve_preferred(&names, &queries(&["x", "y"])).is_err());
+    }
+
+    #[test]
+    fn first_preferred_match_respects_cli_order() {
+        let names = vec!["infnoise-1-1:1.0", "tpm-rng-0"];
+        let queries = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // skips unavailable, picks next.
+        assert_eq!(
+            first_preferred_match(&names, &queries(&["nope", "tpm", "infnoise"])),
+            Some("tpm-rng-0")
+        );
+        // first available wins regardless of later entries.
+        assert_eq!(
+            first_preferred_match(&names, &queries(&["infnoise", "tpm"])),
+            Some("infnoise-1-1:1.0")
+        );
+        // nothing matches.
+        assert_eq!(first_preferred_match(&names, &queries(&["a", "b"])), None);
     }
 }
