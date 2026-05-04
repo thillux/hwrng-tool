@@ -1,18 +1,30 @@
-use std::fs::{self, File};
+use std::cell::RefCell;
+use std::ffi::c_int;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use syslog::{Facility, Formatter3164, LoggerBackend};
 
 const HWRNG_DIR: &str = "/sys/class/misc/hw_random";
 const HWRNG_DEV: &str = "/dev/hwrng";
+const RANDOM_DEV: &str = "/dev/random";
+
+// /dev/random ioctls. _IOW('R', 0x03, int[2]) and _IO('R', 0x07).
+nix::ioctl_write_ptr!(rnd_add_entropy, b'R', 0x03, [c_int; 2]);
+nix::ioctl_none!(rnd_reseed_crng, b'R', 0x07);
 
 #[derive(Parser)]
 #[command(name = "hwrng", about = "Manage the Linux hwrng subsystem", version)]
 struct Cli {
+    /// Send status/log messages to syslog (LOG_DAEMON) instead of stderr/stdout.
+    #[arg(long, global = true)]
+    syslog: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -65,36 +77,141 @@ enum Command {
         #[arg(long, default_value_t = 2.0)]
         interval: f64,
     },
+
+    /// Block until rng_current matches one of NAME, then exit success.
+    ///
+    /// Polls /sys/class/misc/hw_random/rng_current and returns as soon as the
+    /// active rng matches any NAME (exact or prefix). Useful for ordering:
+    /// gate a script or service on the desired entropy source being live.
+    Wait {
+        /// Names (or unique prefixes); any match satisfies the wait.
+        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        names: Vec<String>,
+        /// Poll interval in seconds.
+        #[arg(long, default_value_t = 2.0)]
+        interval: f64,
+    },
+
+    /// Reseed the kernel entropy pool with BYTES from /dev/hwrng (RNDADDENTROPY).
+    ///
+    /// Reads BYTES from the active hwrng and injects them into the kernel
+    /// pool via the RNDADDENTROPY ioctl with --bits of entropy credited
+    /// (default: BYTES * 8, i.e. full credit — assumes the active hwrng is
+    /// trusted). Pass --reseed-crng to additionally force a CRNG reseed
+    /// (RNDRESEEDCRNG; Linux 5.10+). Both ioctls require CAP_SYS_ADMIN.
+    /// BYTES may be 0 if you only want --reseed-crng.
+    Reseed {
+        /// Number of bytes to read from /dev/hwrng and inject. 0 skips RNDADDENTROPY.
+        bytes: usize,
+        /// Entropy bits to credit on insertion (0 = mix without crediting). Defaults to BYTES * 8.
+        #[arg(long)]
+        bits: Option<u32>,
+        /// After inserting, also issue RNDRESEEDCRNG to force a CRNG reseed.
+        #[arg(long)]
+        reseed_crng: bool,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let logger = match Logger::new(cli.syslog) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("hwrng: failed to open syslog: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let result = match cli.command {
-        Command::Switch { names } => switch(&names),
+        Command::Switch { names } => switch(&names, &logger),
         Command::List => list(),
         Command::Info => info(),
         Command::Read { bytes, hex } => read_random(bytes, hex),
-        Command::Watch { names, interval } => watch(&names, interval),
+        Command::Watch { names, interval } => watch(&names, interval, &logger),
+        Command::Wait { names, interval } => wait(&names, interval, &logger),
+        Command::Reseed {
+            bytes,
+            bits,
+            reseed_crng,
+        } => reseed(bytes, bits, reseed_crng, &logger),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("hwrng: {e}");
+            logger.error(&e);
             ExitCode::FAILURE
         }
     }
 }
 
-fn switch(queries: &[String]) -> Result<(), String> {
+type SyslogWriter = syslog::Logger<LoggerBackend, Formatter3164>;
+
+enum Logger {
+    Stderr,
+    Syslog(RefCell<SyslogWriter>),
+}
+
+impl Logger {
+    fn new(use_syslog: bool) -> Result<Self, String> {
+        if !use_syslog {
+            return Ok(Logger::Stderr);
+        }
+        let formatter = Formatter3164 {
+            facility: Facility::LOG_DAEMON,
+            hostname: None,
+            process: "hwrng".into(),
+            pid: std::process::id(),
+        };
+        let writer = syslog::unix(formatter).map_err(|e| e.to_string())?;
+        Ok(Logger::Syslog(RefCell::new(writer)))
+    }
+
+    fn info(&self, msg: &str) {
+        match self {
+            Logger::Stderr => eprintln!("hwrng: {msg}"),
+            Logger::Syslog(w) => {
+                let _ = w.borrow_mut().info(msg);
+            }
+        }
+    }
+
+    fn notice(&self, msg: &str) {
+        match self {
+            Logger::Stderr => eprintln!("hwrng: {msg}"),
+            Logger::Syslog(w) => {
+                let _ = w.borrow_mut().notice(msg);
+            }
+        }
+    }
+
+    fn warn(&self, msg: &str) {
+        match self {
+            Logger::Stderr => eprintln!("hwrng: {msg}"),
+            Logger::Syslog(w) => {
+                let _ = w.borrow_mut().warning(msg);
+            }
+        }
+    }
+
+    fn error(&self, msg: &str) {
+        match self {
+            Logger::Stderr => eprintln!("hwrng: {msg}"),
+            Logger::Syslog(w) => {
+                let _ = w.borrow_mut().err(msg);
+            }
+        }
+    }
+}
+
+fn switch(queries: &[String], logger: &Logger) -> Result<(), String> {
     let dir = Path::new(HWRNG_DIR);
     let available = read_trimmed(&dir.join("rng_available"))?;
     let names: Vec<&str> = available.split_whitespace().collect();
 
-    let target = resolve_preferred(&names, queries)?;
+    let target = resolve_preferred(&names, queries, logger)?;
 
     let current = read_trimmed(&dir.join("rng_current")).unwrap_or_default();
     if current == target {
-        println!("hwrng already set to {target}");
+        logger.info(&format!("already set to {target}"));
         return Ok(());
     }
 
@@ -106,11 +223,11 @@ fn switch(queries: &[String]) -> Result<(), String> {
         }
     })?;
 
-    println!("switched hwrng: {current} -> {target}");
+    logger.notice(&format!("switched: {current} -> {target}"));
     Ok(())
 }
 
-fn watch(queries: &[String], interval_secs: f64) -> Result<(), String> {
+fn watch(queries: &[String], interval_secs: f64, logger: &Logger) -> Result<(), String> {
     if !(interval_secs.is_finite() && interval_secs > 0.0) {
         return Err(format!("invalid --interval {interval_secs}: must be > 0"));
     }
@@ -118,7 +235,9 @@ fn watch(queries: &[String], interval_secs: f64) -> Result<(), String> {
     let dir = Path::new(HWRNG_DIR);
 
     let pretty = format_query_list(queries);
-    eprintln!("hwrng: watching for {pretty}, polling every {interval_secs}s (Ctrl-C to stop)");
+    logger.info(&format!(
+        "watching for {pretty}, polling every {interval_secs}s (Ctrl-C to stop)"
+    ));
 
     let mut last_state: Option<String> = None;
     loop {
@@ -137,25 +256,25 @@ fn watch(queries: &[String], interval_secs: f64) -> Result<(), String> {
         match target {
             Some(t) if t != current => {
                 if log_now {
-                    eprintln!("hwrng: switching {current} -> {t}");
+                    logger.notice(&format!("switching {current} -> {t}"));
                 }
                 if let Err(e) = fs::write(dir.join("rng_current"), t.as_bytes()) {
                     if e.kind() == io::ErrorKind::PermissionDenied {
                         return Err(format!("writing rng_current requires root: {e}"));
                     }
                     if log_now {
-                        eprintln!("hwrng: switch to {t} failed: {e}");
+                        logger.warn(&format!("switch to {t} failed: {e}"));
                     }
                 }
             }
             Some(t) => {
                 if log_now {
-                    eprintln!("hwrng: {pretty} active as {t}");
+                    logger.info(&format!("{pretty} active as {t}"));
                 }
             }
             None => {
                 if log_now {
-                    eprintln!("hwrng: no rng matches {pretty} (current: {current})");
+                    logger.warn(&format!("no rng matches {pretty} (current: {current})"));
                 }
             }
         }
@@ -163,6 +282,49 @@ fn watch(queries: &[String], interval_secs: f64) -> Result<(), String> {
         last_state = Some(state);
         thread::sleep(interval);
     }
+}
+
+fn wait(queries: &[String], interval_secs: f64, logger: &Logger) -> Result<(), String> {
+    if !(interval_secs.is_finite() && interval_secs > 0.0) {
+        return Err(format!("invalid --interval {interval_secs}: must be > 0"));
+    }
+    let interval = Duration::from_secs_f64(interval_secs);
+    let path = Path::new(HWRNG_DIR).join("rng_current");
+    let pretty = format_query_list(queries);
+
+    let initial = read_trimmed(&path).unwrap_or_default();
+    if current_matches_any(&initial, queries) {
+        logger.info(&format!("rng_current already matches {pretty}: {initial}"));
+        return Ok(());
+    }
+    logger.info(&format!(
+        "waiting for {pretty}, current: {initial} (Ctrl-C to abort)"
+    ));
+
+    let mut last_seen = initial;
+    loop {
+        thread::sleep(interval);
+        let current = read_trimmed(&path).unwrap_or_default();
+        if current_matches_any(&current, queries) {
+            logger.notice(&format!("rng_current matches {pretty}: {current}"));
+            return Ok(());
+        }
+        if current != last_seen {
+            logger.info(&format!(
+                "rng_current changed to {current}, still waiting for {pretty}"
+            ));
+            last_seen = current;
+        }
+    }
+}
+
+fn current_matches_any(current: &str, queries: &[String]) -> bool {
+    if current.is_empty() {
+        return false;
+    }
+    queries
+        .iter()
+        .any(|q| current == q || current.starts_with(q))
 }
 
 fn first_match<'a>(names: &[&'a str], query: &str) -> Option<&'a str> {
@@ -464,7 +626,79 @@ fn read_random(bytes: u64, hex: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn try_resolve(names: &[&str], query: &str) -> Option<String> {
+fn reseed(
+    bytes: usize,
+    bits: Option<u32>,
+    reseed_crng: bool,
+    logger: &Logger,
+) -> Result<(), String> {
+    if bytes == 0 && !reseed_crng {
+        return Err("nothing to do: pass BYTES > 0 or --reseed-crng".into());
+    }
+
+    let rnd = OpenOptions::new()
+        .write(true)
+        .open(RANDOM_DEV)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                format!("opening {RANDOM_DEV} writable requires root (try sudo): {e}")
+            } else {
+                format!("failed to open {RANDOM_DEV}: {e}")
+            }
+        })?;
+
+    if bytes > 0 {
+        let max_bits = bytes.saturating_mul(8);
+        let bits = bits.unwrap_or_else(|| max_bits.min(i32::MAX as usize) as u32);
+        if bits > i32::MAX as u32 {
+            return Err(format!("--bits {bits} exceeds INT_MAX"));
+        }
+        if (bits as usize) > max_bits {
+            return Err(format!(
+                "--bits {bits} exceeds {max_bits} (BYTES * 8): cannot credit more entropy than the data carries"
+            ));
+        }
+
+        // Layout struct rand_pool_info { i32 entropy_count; i32 buf_size; u8 buf[bytes]; }
+        // in a u32-aligned buffer so the kernel sees naturally-aligned ints.
+        let header_words = 2;
+        let buf_words = bytes.div_ceil(4);
+        let mut payload: Vec<u32> = vec![0; header_words + buf_words];
+        payload[0] = bits;
+        payload[1] = bytes as u32;
+        let buf_ptr = unsafe { payload.as_mut_ptr().add(header_words).cast::<u8>() };
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr, bytes) };
+
+        let mut hw = File::open(HWRNG_DEV).map_err(|e| {
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                format!("opening {HWRNG_DEV} requires root (try sudo): {e}")
+            } else {
+                format!("failed to open {HWRNG_DEV}: {e}")
+            }
+        })?;
+        hw.read_exact(buf_slice)
+            .map_err(|e| format!("read from {HWRNG_DEV} failed: {e}"))?;
+        drop(hw);
+
+        unsafe {
+            rnd_add_entropy(rnd.as_raw_fd(), payload.as_ptr().cast())
+        }
+        .map_err(|e| format!("RNDADDENTROPY ioctl failed: {e}"))?;
+        logger.info(&format!(
+            "fed {bytes} bytes from {HWRNG_DEV} into kernel entropy pool ({bits} bits credited)"
+        ));
+    }
+
+    if reseed_crng {
+        unsafe { rnd_reseed_crng(rnd.as_raw_fd()) }
+            .map_err(|e| format!("RNDRESEEDCRNG ioctl failed: {e}"))?;
+        logger.info("triggered CRNG reseed (RNDRESEEDCRNG)");
+    }
+
+    Ok(())
+}
+
+fn try_resolve(names: &[&str], query: &str, logger: &Logger) -> Option<String> {
     if let Some(exact) = names.iter().find(|n| **n == query) {
         return Some((*exact).to_string());
     }
@@ -477,21 +711,21 @@ fn try_resolve(names: &[&str], query: &str) -> Option<String> {
         [] => None,
         [only] => Some((*only).to_string()),
         [first, rest @ ..] => {
-            eprintln!(
-                "hwrng: '{query}' matches {}, picking {first}",
+            logger.warn(&format!(
+                "'{query}' matches {}, picking {first}",
                 std::iter::once(*first)
                     .chain(rest.iter().copied())
                     .collect::<Vec<_>>()
                     .join(", ")
-            );
+            ));
             Some((*first).to_string())
         }
     }
 }
 
-fn resolve_preferred(names: &[&str], queries: &[String]) -> Result<String, String> {
+fn resolve_preferred(names: &[&str], queries: &[String], logger: &Logger) -> Result<String, String> {
     for q in queries {
-        if let Some(r) = try_resolve(names, q) {
+        if let Some(r) = try_resolve(names, q, logger) {
             return Ok(r);
         }
     }
@@ -511,7 +745,8 @@ fn read_trimmed(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        first_match, first_preferred_match, normalize_root, parse_trailing_index, resolve_preferred,
+        current_matches_any, first_match, first_preferred_match, normalize_root,
+        parse_trailing_index, resolve_preferred, Logger,
     };
 
     #[test]
@@ -554,36 +789,59 @@ mod tests {
     fn resolve_preferred_picks_first_on_ambiguous_prefix() {
         let names = vec!["infnoise-1-1:1.0", "infnoise-2-1:1.0", "tpm-rng-0"];
         let q = |s: &str| vec![s.to_string()];
+        let log = Logger::Stderr;
         // single-match prefix.
-        assert_eq!(resolve_preferred(&names, &q("tpm")).unwrap(), "tpm-rng-0");
+        assert_eq!(
+            resolve_preferred(&names, &q("tpm"), &log).unwrap(),
+            "tpm-rng-0"
+        );
         // ambiguous prefix → first match.
         assert_eq!(
-            resolve_preferred(&names, &q("infnoise")).unwrap(),
+            resolve_preferred(&names, &q("infnoise"), &log).unwrap(),
             "infnoise-1-1:1.0"
         );
         // exact match wins even when it'd also be a prefix.
         let names2 = vec!["foo", "foobar"];
-        assert_eq!(resolve_preferred(&names2, &q("foo")).unwrap(), "foo");
+        assert_eq!(
+            resolve_preferred(&names2, &q("foo"), &log).unwrap(),
+            "foo"
+        );
         // no match → error.
-        assert!(resolve_preferred(&names, &q("nope")).is_err());
+        assert!(resolve_preferred(&names, &q("nope"), &log).is_err());
     }
 
     #[test]
     fn resolve_preferred_falls_back_in_cli_order() {
         let names = vec!["infnoise-1-1:1.0", "tpm-rng-0"];
         let queries = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let log = Logger::Stderr;
         // first preference unavailable → fall back to second.
         assert_eq!(
-            resolve_preferred(&names, &queries(&["nonsense", "tpm"])).unwrap(),
+            resolve_preferred(&names, &queries(&["nonsense", "tpm"]), &log).unwrap(),
             "tpm-rng-0"
         );
         // first preference available → wins even if later ones also match.
         assert_eq!(
-            resolve_preferred(&names, &queries(&["infnoise", "tpm"])).unwrap(),
+            resolve_preferred(&names, &queries(&["infnoise", "tpm"]), &log).unwrap(),
             "infnoise-1-1:1.0"
         );
         // none match → error.
-        assert!(resolve_preferred(&names, &queries(&["x", "y"])).is_err());
+        assert!(resolve_preferred(&names, &queries(&["x", "y"]), &log).is_err());
+    }
+
+    #[test]
+    fn current_matches_any_handles_exact_prefix_and_misses() {
+        let q = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // exact match.
+        assert!(current_matches_any("tpm-rng-0", &q(&["tpm-rng-0"])));
+        // prefix match — current is more specific than query.
+        assert!(current_matches_any("infnoise-1-1:1.0", &q(&["infnoise"])));
+        // any-of: second query wins.
+        assert!(current_matches_any("tpm-rng-0", &q(&["nonsense", "tpm"])));
+        // no overlap.
+        assert!(!current_matches_any("intel-rng", &q(&["tpm", "infnoise"])));
+        // empty current never matches.
+        assert!(!current_matches_any("", &q(&["tpm"])));
     }
 
     #[test]
