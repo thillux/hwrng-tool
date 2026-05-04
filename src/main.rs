@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use syslog::{Facility, Formatter3164, LoggerBackend};
 
 const HWRNG_DIR: &str = "/sys/class/misc/hw_random";
@@ -41,6 +41,8 @@ enum Command {
         /// Names (or unique prefixes) in preference order; the first available is activated.
         #[arg(required = true, num_args = 1.., value_name = "NAME")]
         names: Vec<String>,
+        #[command(flatten)]
+        reseed_opts: ReseedOpts,
     },
 
     /// List available rngs, marking the active one with `*`.
@@ -90,6 +92,8 @@ enum Command {
         /// Poll interval in seconds.
         #[arg(long, default_value_t = 2.0)]
         interval: f64,
+        #[command(flatten)]
+        reseed_opts: ReseedOpts,
     },
 
     /// Reseed the kernel entropy pool with BYTES from /dev/hwrng (RNDADDENTROPY).
@@ -112,6 +116,38 @@ enum Command {
     },
 }
 
+/// Optional follow-on reseed step shared by `switch` and `wait`.
+///
+/// Triggered when `--reseed BYTES` and/or `--reseed-crng` is set. Runs after
+/// the primary action (rng switch / wait condition) succeeds and reuses the
+/// same code path as the standalone `reseed` command.
+#[derive(Args, Clone)]
+struct ReseedOpts {
+    /// After the action succeeds, reseed the kernel pool with BYTES from /dev/hwrng (RNDADDENTROPY).
+    #[arg(long = "reseed", value_name = "BYTES")]
+    reseed: Option<usize>,
+    /// Entropy bits to credit on reseed insertion (0 = mix without crediting). Defaults to BYTES * 8.
+    #[arg(long, requires = "reseed", value_name = "N")]
+    reseed_bits: Option<u32>,
+    /// Also issue RNDRESEEDCRNG. May be set without --reseed for a CRNG-only reseed.
+    #[arg(long)]
+    reseed_crng: bool,
+}
+
+impl ReseedOpts {
+    fn run(&self, logger: &Logger) -> Result<(), String> {
+        if self.reseed.is_none() && !self.reseed_crng {
+            return Ok(());
+        }
+        reseed(
+            self.reseed.unwrap_or(0),
+            self.reseed_bits,
+            self.reseed_crng,
+            logger,
+        )
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let logger = match Logger::new(cli.syslog) {
@@ -122,12 +158,16 @@ fn main() -> ExitCode {
         }
     };
     let result = match cli.command {
-        Command::Switch { names } => switch(&names, &logger),
+        Command::Switch { names, reseed_opts } => switch(&names, &reseed_opts, &logger),
         Command::List => list(),
         Command::Info => info(),
         Command::Read { bytes, hex } => read_random(bytes, hex),
         Command::Watch { names, interval } => watch(&names, interval, &logger),
-        Command::Wait { names, interval } => wait(&names, interval, &logger),
+        Command::Wait {
+            names,
+            interval,
+            reseed_opts,
+        } => wait(&names, interval, &reseed_opts, &logger),
         Command::Reseed {
             bytes,
             bits,
@@ -202,7 +242,7 @@ impl Logger {
     }
 }
 
-fn switch(queries: &[String], logger: &Logger) -> Result<(), String> {
+fn switch(queries: &[String], reseed_opts: &ReseedOpts, logger: &Logger) -> Result<(), String> {
     let dir = Path::new(HWRNG_DIR);
     let available = read_trimmed(&dir.join("rng_available"))?;
     let names: Vec<&str> = available.split_whitespace().collect();
@@ -212,19 +252,18 @@ fn switch(queries: &[String], logger: &Logger) -> Result<(), String> {
     let current = read_trimmed(&dir.join("rng_current")).unwrap_or_default();
     if current == target {
         logger.info(&format!("already set to {target}"));
-        return Ok(());
+    } else {
+        fs::write(dir.join("rng_current"), target.as_bytes()).map_err(|e| {
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                format!("writing rng_current requires root (try sudo): {e}")
+            } else {
+                format!("failed to write rng_current: {e}")
+            }
+        })?;
+        logger.notice(&format!("switched: {current} -> {target}"));
     }
 
-    fs::write(dir.join("rng_current"), target.as_bytes()).map_err(|e| {
-        if e.kind() == io::ErrorKind::PermissionDenied {
-            format!("writing rng_current requires root (try sudo): {e}")
-        } else {
-            format!("failed to write rng_current: {e}")
-        }
-    })?;
-
-    logger.notice(&format!("switched: {current} -> {target}"));
-    Ok(())
+    reseed_opts.run(logger)
 }
 
 fn watch(queries: &[String], interval_secs: f64, logger: &Logger) -> Result<(), String> {
@@ -284,7 +323,12 @@ fn watch(queries: &[String], interval_secs: f64, logger: &Logger) -> Result<(), 
     }
 }
 
-fn wait(queries: &[String], interval_secs: f64, logger: &Logger) -> Result<(), String> {
+fn wait(
+    queries: &[String],
+    interval_secs: f64,
+    reseed_opts: &ReseedOpts,
+    logger: &Logger,
+) -> Result<(), String> {
     if !(interval_secs.is_finite() && interval_secs > 0.0) {
         return Err(format!("invalid --interval {interval_secs}: must be > 0"));
     }
@@ -295,7 +339,7 @@ fn wait(queries: &[String], interval_secs: f64, logger: &Logger) -> Result<(), S
     let initial = read_trimmed(&path).unwrap_or_default();
     if current_matches_any(&initial, queries) {
         logger.info(&format!("rng_current already matches {pretty}: {initial}"));
-        return Ok(());
+        return reseed_opts.run(logger);
     }
     logger.info(&format!(
         "waiting for {pretty}, current: {initial} (Ctrl-C to abort)"
@@ -307,7 +351,7 @@ fn wait(queries: &[String], interval_secs: f64, logger: &Logger) -> Result<(), S
         let current = read_trimmed(&path).unwrap_or_default();
         if current_matches_any(&current, queries) {
             logger.notice(&format!("rng_current matches {pretty}: {current}"));
-            return Ok(());
+            return reseed_opts.run(logger);
         }
         if current != last_seen {
             logger.info(&format!(
